@@ -1,4 +1,4 @@
-"""PrimeVideoPlayer 1.0.0 application state machine and resource ownership."""
+"""PrimeVideoPlayer 1.1.0 application state machine and resource ownership."""
 
 import sys
 import prime_native as native
@@ -6,6 +6,7 @@ from prime_video_clock import FrameClock
 from prime_video_files import NativeDirectoryScanner
 from prime_video_model import PlayerModel, PlayerState
 from prime_video_positions import PositionStore
+from prime_video_settings import SettingsStore, default_settings
 from prime_video_runtime import (PlayerBridge, PlayerScreen, ScreenAwake,
                                  key_event, ticks_ms, wait_ms)
 from prime_video_sessions import M1VPlaybackSession, MjpgPlaybackSession
@@ -16,12 +17,12 @@ Error = native.Error
 class PlayerLog(native.RunLog):
     def __init__(self, path="prime_video_player.log"):
         native.RunLog.__init__(
-            self, path, "PrimeVideoPlayer 1.0.0 G1/2025-09-15")
+            self, path, "PrimeVideoPlayer 1.1.0 G1/2025-09-15")
 
 
 class PrimeVideoPlayer:
     def __init__(self, bridge_factory=None, screen=None, emit=None,
-                 position_store=None):
+                 position_store=None, settings_store=None):
         self.bridge_factory = bridge_factory or self._new_bridge
         self.screen = screen or PlayerScreen()
         self.emit = emit or (lambda message, visible=True: None)
@@ -30,6 +31,7 @@ class PrimeVideoPlayer:
         self.screen_awake = None
         self.clock = None
         self.positions = position_store or PositionStore()
+        self.settings_store = settings_store or SettingsStore()
 
     @staticmethod
     def _new_bridge():
@@ -79,7 +81,8 @@ class PrimeVideoPlayer:
             entry = model.files[model.index]
             session_type = (M1VPlaybackSession if entry.extension == ".M1V"
                             else MjpgPlaybackSession)
-            self.session = session_type(self.bridge, entry, self.emit)
+            self.session = session_type(self.bridge, entry, self.emit,
+                                        model.settings)
             self.session.start()
             self.session.set_video_bottom(
                 self.screen.video_bottom(model.debug_mode))
@@ -137,6 +140,7 @@ class PrimeVideoPlayer:
     def _new_clock(self, model):
         fps_num, fps_den = self.session.fps
         self.clock = FrameClock(fps_num, fps_den, ticks_ms, wait_ms)
+        self.session.display_fps_tenths = 0
         if model.state == PlayerState.PAUSED:
             self.clock.pause()
 
@@ -156,9 +160,11 @@ class PrimeVideoPlayer:
         action = model.event(event, self.session.position_tenths)
         if action == "PAUSE":
             self.clock.pause()
+            self.session.display_fps_tenths = 0
             self._save_current_position(model)
         elif action == "RESUME":
             self.clock.resume()
+            self.session.display_fps_tenths = 0
         elif action == "SEEK_BEGIN":
             if model.seek_return_state == PlayerState.PLAYING:
                 self.clock.pause()
@@ -189,17 +195,23 @@ class PrimeVideoPlayer:
                 wait_ms(20)
                 continue
             render_start = ticks_ms()
-            if not self.session.next_frame():
+            present = self.clock.should_present(model.settings.timing)
+            if not self.session.next_frame(present):
                 self._save_current_position(model, True)
                 return model.finished()
-            self.screen.video_frame_updated()
+            if present:
+                self.screen.video_frame_updated()
             self.screen.playback(entry, self.session, model, False)
             render_end = ticks_ms()
             render_ms = render_end - render_start
             if render_ms < 0:
                 render_ms &= 0xFFFFFFFF
-            self.clock.frame_presented(render_ms)
+            self.clock.frame_decoded(present, render_ms,
+                                     model.settings.timing)
             self.session.late_frames = self.clock.late_frames
+            self.session.presented_frames = self.clock.presented_frames
+            self.session.dropped_frames = self.clock.dropped_frames
+            self.session.display_fps_tenths = self.clock.display_fps_tenths
             action = self._play_event(model, key_event())
             if action in ("STOP", "SWITCH"):
                 return action
@@ -210,7 +222,19 @@ class PrimeVideoPlayer:
         primary = None
         try:
             try:
-                model = PlayerModel(self._temporary_scan())
+                try:
+                    settings = self.settings_store.load()
+                except BaseException as exc:
+                    self.screen.error("SETTINGS_STORE_INVALID: " + str(exc))
+                    while True:
+                        event = key_event()
+                        if event == "ENTER":
+                            settings = self.settings_store.reset()
+                            break
+                        if event == "BACK":
+                            return
+                        wait_ms(25)
+                model = PlayerModel(self._temporary_scan(), settings)
                 try:
                     self.positions.load()
                 except BaseException as exc:
@@ -235,6 +259,24 @@ class PrimeVideoPlayer:
                             self.screen.error(model.error)
                     else:
                         self.screen.list(model)
+                        wait_ms(25)
+                    continue
+
+                if model.state == PlayerState.SETTINGS:
+                    self.screen.settings(model)
+                    action = model.event(key_event(repeat=True))
+                    if action == "SETTINGS_SAVE":
+                        try:
+                            self.settings_store.save(model.settings_draft)
+                        except BaseException as exc:
+                            model.fail("SETTINGS_SAVE_FAILED: " + str(exc))
+                            self.screen.error(model.error)
+                        else:
+                            model.commit_settings()
+                            self.screen.list(model)
+                    elif action == "SETTINGS_CANCEL":
+                        self.screen.list(model)
+                    else:
                         wait_ms(25)
                     continue
 

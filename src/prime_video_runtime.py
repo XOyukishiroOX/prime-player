@@ -2,8 +2,10 @@
 
 import hpprime
 import prime_native as native
+from prime_video_i18n import text as tr
 import prime_video_profile as profile
 from prime_video_model import DebugMode, PlayerState
+from prime_video_settings import SETTING_KEYS
 
 Error = native.Error
 struct = native.struct
@@ -15,7 +17,7 @@ _repeat_last = None
 
 KEY_REPEAT_DELAY_MS = 320
 KEY_REPEAT_INTERVAL_MS = 40
-LIST_BACKGROUND = 0x101214
+LIST_BACKGROUND = 0x0B1117
 LIST_TEXT = 0xE7EAEC
 LIST_MUTED = 0xA8B0B8
 LIST_ACCENT = 0x55D6BE
@@ -150,6 +152,18 @@ class PlayerScreen:
         self._signature = None
         self._play_mode = None
         self._play_lines = [None, None, None, None]
+        self._fps_line = None
+        self._frame_updated = False
+        self.language = "ZH_CN"
+        self.theme = "DARK"
+
+    def palette(self, theme=None):
+        theme = theme or self.theme
+        if theme == "LIGHT":
+            return (0xF1F5F7, 0xFFFFFF, 0x17242B, 0x607179,
+                    0x087E72, 0xD6EFEB, 0xB42318)
+        return (0x0B1117, 0x121C24, 0xEDF7F5, 0x91A7AD,
+                0x35D0BA, 0x173C3B, 0xFF7A86)
 
     def text(self, value, x, y, color=0x101318, width=320,
              background=0xFFFFFF, clear_background=True, height=16):
@@ -159,129 +173,217 @@ class PlayerScreen:
             hpprime.fillrect(0, x, y, width, height, background, background)
         hpprime.textout(0, x, y, value, color)
 
-    def clear(self, color=0xFFFFFF):
+    def clear(self, color=None):
+        if color is None:
+            color = self.palette()[0]
         hpprime.fillrect(0, 0, 0, 320, 240, color, color)
         self._view = None
         self._signature = None
         self._play_mode = None
         self._play_lines = [None, None, None, None]
+        self._fps_line = None
+        self._frame_updated = False
 
     def video_frame_updated(self):
         # A decoded frame can overwrite the panel even when its text is unchanged.
         self._play_lines = [None, None, None, None]
+        self._fps_line = None
+        self._frame_updated = True
 
     @staticmethod
     def video_bottom(debug_mode):
-        if debug_mode == DebugMode.FULL:
-            return 179
-        if debug_mode == DebugMode.PROGRESS:
-            return 217
+        # Overlays are drawn after presentation, on top of the full video.
         return 239
 
     def list(self, model):
+        self.language = model.settings.language
+        self.theme = model.settings.theme
+        background, card, foreground, muted, accent, selection, danger = self.palette()
         first = (max(0, min(model.selected - 5, len(model.files) - 10))
                  if model.files else 0)
-        signature = (model.selected, model.mode, len(model.files), first)
+        signature = (model.selected, model.mode, len(model.files), first,
+                     model.settings.as_tuple())
         if self._view == "LIST" and self._signature == signature:
             return
         if self._view != "LIST":
-            self.clear(LIST_BACKGROUND)
+            self.clear(background)
         else:
-            hpprime.fillrect(0, 0, 16, 320, 208, LIST_BACKGROUND,
-                             LIST_BACKGROUND)
-        self.text("PrimeVideoPlayer 1.0.0", 4, 4, LIST_ACCENT, 312,
-                  LIST_BACKGROUND)
-        self.text("%d file(s)  end:%s" % (len(model.files), model.mode),
-                  4, 20, LIST_MUTED, 312, LIST_BACKGROUND)
+            hpprime.fillrect(0, 0, 0, 320, 218, background, background)
+        self.text("PrimeVideoPlayer 1.1.0", 10, 5, accent, 300, background)
+        self.text(tr(self.language, "files", len(model.files)), 10, 23,
+                  muted, 300, background)
+        hpprime.fillrect(0, 6, 38, 308, 176, card, card)
         if not model.files:
-            self.text("No .M1V or .MJPG files", 4, 54, 0xFF6B6B, 312,
-                      LIST_BACKGROUND)
-            self.text("ESC: exit", 4, 72, LIST_MUTED, 312,
-                      LIST_BACKGROUND)
+            self.text(tr(self.language, "no_files"), 16, 70, danger, 288,
+                      card)
             self._view, self._signature = "LIST", signature
-            return
-        for row, index in enumerate(range(first, min(first + 10,
-                                                      len(model.files)))):
-            entry = model.files[index]
-            marker = ">" if index == model.selected else " "
-            size_kib = (entry.size + 1023) // 1024
-            self.text("%s %-22s %5dK" %
-                      (marker, entry.name[:22], size_kib), 4, 40 + row * 16,
-                      0xFFFFFF if index == model.selected else LIST_TEXT,
-                      312,
-                      LIST_SELECTION if index == model.selected else
-                      LIST_BACKGROUND)
-        self.text("ENTER play  ESC exit  HELP end mode", 4, 224,
-                  LIST_MUTED, 312, LIST_BACKGROUND)
+        else:
+            for row, index in enumerate(range(first, min(first + 9,
+                                                          len(model.files)))):
+                entry = model.files[index]
+                chosen = index == model.selected
+                y = 42 + row * 19
+                row_background = selection if chosen else card
+                hpprime.fillrect(0, 9, y, 302, 18, row_background,
+                                 row_background)
+                size_kib = (entry.size + 1023) // 1024
+                self.text(entry.name[:23], 14, y + 1,
+                          foreground, 214, row_background, False, 16)
+                self.text("%s %dK" % (entry.extension[1:], size_kib),
+                          232, y + 1, accent if chosen else muted, 76,
+                          row_background, False, 16)
+        footer = tr(self.language, "list_help")
+        self.text(footer, 6, 222, muted, 308, background)
         self._view, self._signature = "LIST", signature
 
+    def settings(self, model):
+        draft = model.settings_draft
+        self.language, self.theme = draft.language, draft.theme
+        background, card, foreground, muted, accent, selection, danger = self.palette()
+        signature = (model.settings_selected, draft.as_tuple())
+        if self._view == "SETTINGS" and self._signature == signature:
+            return
+        self.clear(background)
+        self.text(tr(self.language, "settings_title"), 10, 6, accent, 300,
+                  background)
+        for row, key in enumerate(SETTING_KEYS):
+            y = 36 + row * 29
+            chosen = row == model.settings_selected
+            row_background = selection if chosen else card
+            hpprime.fillrect(0, 8, y, 304, 25, row_background, row_background)
+            self.text(tr(self.language, key), 14, y + 4, foreground, 142,
+                      row_background, False, 17)
+            value = getattr(draft, key)
+            self.text(tr(self.language, value), 160, y + 4,
+                      accent if chosen else muted, 145, row_background,
+                      False, 17)
+        footer = tr(self.language, "settings_help")
+        self.text(footer, 8, 222, muted, 304, background)
+        self._view, self._signature = "SETTINGS", signature
+
     def playback(self, entry, session, model, paused=False):
+        self.language, self.theme = (model.settings.language,
+                                     model.settings.theme)
+        background, card, foreground, muted, accent, selection, danger = self.palette()
         debug_mode = model.debug_mode
         session.set_video_bottom(self.video_bottom(debug_mode))
-        if self._view != "PLAYBACK" or self._play_mode != debug_mode:
+        mode_changed = (self._view != "PLAYBACK" or
+                        self._play_mode != debug_mode)
+        if mode_changed:
+            if (self._view == "PLAYBACK" and not self._frame_updated and
+                    getattr(session, "current_frame", False)):
+                session.present_current()
             self._play_lines = [None, None, None, None]
+            self._fps_line = None
             self._play_mode = debug_mode
         self._view = "PLAYBACK"
         self._signature = None
         if debug_mode == DebugMode.OFF:
+            self._frame_updated = False
+            return
+
+        # A skipped decode must not cause an overlay-only screen update. The
+        # next successfully presented frame will refresh both video and text.
+        if (not self._frame_updated and not mode_changed and
+                model.state == PlayerState.PLAYING):
             return
 
         position = (model.seek_target if model.state == PlayerState.SEEKING
                     else session.position_tenths)
+        fps_tenths = (0 if paused or model.state == PlayerState.SEEKING else
+                      getattr(session, "display_fps_tenths", 0))
+        fps_line = "FPS:%d.%d" % (fps_tenths // 10, fps_tenths % 10)
         if debug_mode == DebugMode.PROGRESS:
-            signature = (position, model.state)
-            if self._play_lines[0] == signature:
+            signature = (position, model.state, fps_line)
+            if (self._play_lines[0] == signature and
+                    self._fps_line == fps_line):
+                self._frame_updated = False
                 return
-            hpprime.fillrect(0, 0, 218, 320, 22, 0, 0)
-            hpprime.fillrect(0, 4, 218, 308, 3, 0x30343B, 0x30343B)
+            if (not self._frame_updated and
+                    getattr(session, "current_frame", False)):
+                session.present_current()
+            hpprime.fillrect(0, 6, 218, 308, 4, muted, muted)
             width = position * 308 // 1000
             if width:
-                hpprime.fillrect(0, 4, 218, width, 3, 0x19A974, 0x19A974)
-            label = ("SEEK %d.%d%%" if model.state == PlayerState.SEEKING
+                hpprime.fillrect(0, 6, 218, width, 4, accent, accent)
+            label = ((tr(self.language, "seeking") + " %d.%d%%")
+                     if model.state == PlayerState.SEEKING
                      else "%d.%d%%") % (position // 10, position % 10)
-            self.text(label, 4, 222, 0xFFFFFF, 312, 0, False, 15)
+            self.text(label, 6, 224, foreground, 308, background, False, 15)
+            fps_x = max(246, 316 - len(fps_line) * 8)
+            self.text(fps_line, fps_x, 2, 0xFFFFFF, 320 - fps_x,
+                      background, False, 15)
             self._play_lines[0] = signature
+            self._fps_line = fps_line
+            self._frame_updated = False
             return
 
         total = session.total_frames
         frame_text = ("%d/%d" % (session.frames, total) if total is not None
                       else "%d" % session.frames)
         if model.state == PlayerState.SEEKING:
-            status = "SEEK %d.%d%% U/D:.1 L/R:5 ENT:go" % (
-                position // 10, position % 10)
+            status = tr(self.language, "seek_help", position // 10,
+                        position % 10)
         else:
-            status = "%s %s ENT:pause ESC:list HELP:ui" % (
-                "PAUSE" if paused else "PLAY", model.mode)
+            status = tr(self.language, "play_help",
+                tr(self.language, "pause") if paused else
+                tr(self.language, "playing"), tr(self.language, model.mode),
+                tr(self.language, "play") if paused else
+                tr(self.language, "pause"))
+        presented = getattr(session, "presented_frames", session.frames)
+        dropped = getattr(session, "dropped_frames", 0)
         lines = (
             entry.name[:39],
-            "%s f:%s t:%dms" %
-            (entry.extension[1:], frame_text, session.source_ms),
-            "r:%d/%dK pos:%d.%d%% late:%d" %
-            ((session.bytes_read + 1023) // 1024,
-             (entry.size + 1023) // 1024, position // 10, position % 10,
-             session.late_frames),
+            tr(self.language, "detail_time", entry.extension[1:], frame_text,
+               session.source_ms),
+            tr(self.language, "detail_stats",
+               (session.bytes_read + 1023) // 1024,
+               (entry.size + 1023) // 1024, position // 10, position % 10,
+               session.late_frames, presented, dropped),
             status[:39],
         )
-        colors = (0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xF9C74F)
+        colors = (foreground, foreground, foreground, accent)
+        if (self._fps_line != fps_line and not self._frame_updated and
+                getattr(session, "current_frame", False)):
+            session.present_current()
+            self._play_lines = [None, None, None, None]
         for row, line in enumerate(lines):
             if self._play_lines[row] == line:
                 continue
             y = 180 + row * 15
-            hpprime.fillrect(0, 0, y, 320, 15, 0, 0)
-            self.text(line, 3, y, colors[row], 314, 0, False, 15)
+            hpprime.fillrect(0, 0, y, 320, 15, background, background)
+            self.text(line, 3, y, colors[row], 314, background, False, 15)
             self._play_lines[row] = line
+        if self._fps_line != fps_line:
+            fps_x = max(246, 316 - len(fps_line) * 8)
+            self.text(fps_line, fps_x, 2, 0xFFFFFF, 320 - fps_x,
+                      background, False, 15)
+            self._fps_line = fps_line
+        self._frame_updated = False
 
     def error(self, message):
         signature = str(message)
         if self._view == "ERROR" and self._signature == signature:
             return
-        self.clear()
-        self.text("Playback error", 4, 6, 0xB42318, 312)
-        words = str(message)
+        background, card, foreground, muted, accent, selection, danger = self.palette()
+        self.clear(background)
+        settings_error = signature.startswith("SETTINGS_STORE_INVALID")
+        memory_error = ("MPEG_OUT_OF_MEMORY" in signature or
+                        "CREATE_FAILED" in signature)
+        title = tr(self.language, "settings_error" if settings_error else
+                   "playback_error")
+        self.text(title, 10, 7, danger, 300,
+                  background)
+        hpprime.fillrect(0, 8, 32, 304, 174, card, card)
+        words = ((tr(self.language, "memory_error") + " | " + signature)
+                 if memory_error else signature)
         for row in range(8):
             if not words:
                 break
-            self.text(words[:38], 4, 32 + row * 18, 0x101318, 312)
+            self.text(words[:38], 14, 38 + row * 18, foreground, 292, card)
             words = words[38:]
-        self.text("ENTER/ESC: return to list", 4, 220, 0x30343B, 312)
+        footer = (tr(self.language, "reset_settings") if settings_error else
+                  "ENTER/ESC: " + tr(self.language, "return_list"))
+        self.text(footer, 8, 220,
+                  muted, 304, background)
         self._view, self._signature = "ERROR", signature

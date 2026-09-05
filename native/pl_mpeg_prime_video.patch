@@ -1,0 +1,39 @@
+diff --git a/vendor/pl_mpeg/pl_mpeg.h b/vendor/pl_mpeg/pl_mpeg.h
+--- a/vendor/pl_mpeg/pl_mpeg.h
++++ b/vendor/pl_mpeg/pl_mpeg.h
+@@
+ struct plm_video_t {
+ 	double framerate;
+ 	double pixel_aspect_ratio;
+ 	double time;
+ 	int frames_decoded;
++	int rate_code;
++	int aspect_code;
++	int allocation_failed;
+@@
+-	frame->time = self->time;
+-	self->frames_decoded++;
+-	self->time = (double)self->frames_decoded / self->framerate;
++	#ifdef PLM_PRIME_INTEGER_VIDEO
++		frame->time = 0;
++		self->frames_decoded++;
++	#else
++		frame->time = self->time;
++		self->frames_decoded++;
++		self->time = (double)self->frames_decoded / self->framerate;
++	#endif
+@@
++	self->aspect_code = plm_buffer_read(self->buffer, 4);
++	#ifndef PLM_PRIME_INTEGER_VIDEO
++		self->pixel_aspect_ratio = PLM_VIDEO_PIXEL_ASPECT_RATIO[self->aspect_code - 1];
++	#endif
++	self->rate_code = plm_buffer_read(self->buffer, 4);
++	#ifndef PLM_PRIME_INTEGER_VIDEO
++		self->framerate = PLM_VIDEO_PICTURE_RATE[self->rate_code];
++	#endif
+@@
+ 	self->frames_data = (uint8_t*)PLM_MALLOC(frame_data_size * 3);
++	if (!self->frames_data) {
++		self->allocation_failed = TRUE;
++		return FALSE;
++	}

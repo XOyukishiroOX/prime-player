@@ -1559,8 +1559,14 @@ size_t plm_buffer_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
 			first = length;
 		}
 		memcpy(self->bytes + write_at, bytes, first);
+#ifdef PLM_PRIME_MIRRORED_RING
+		memcpy(self->bytes + write_at + self->capacity, bytes, first);
+#endif
 		if (length > first) {
 			memcpy(self->bytes, bytes + first, length - first);
+#ifdef PLM_PRIME_MIRRORED_RING
+			memcpy(self->bytes + self->capacity, bytes + first, length - first);
+#endif
 		}
 		self->length += length;
 		self->has_ended = FALSE;
@@ -1725,9 +1731,11 @@ int plm_buffer_has(plm_buffer_t *self, size_t count) {
 uint8_t plm_buffer_byte_at(plm_buffer_t *self, size_t index) {
 	if (self->mode == PLM_BUFFER_MODE_RING) {
 		size_t physical = self->ring_start + index;
+#ifndef PLM_PRIME_MIRRORED_RING
 		if (physical >= self->capacity) {
 			physical -= self->capacity;
 		}
+#endif
 		return self->bytes[physical];
 	}
 	return self->bytes[index];
@@ -2765,6 +2773,9 @@ struct plm_video_t {
 	double pixel_aspect_ratio;
 	double time;
 	int frames_decoded;
+	int rate_code;
+	int aspect_code;
+	int allocation_failed;
 	int width;
 	int height;
 	int mb_width;
@@ -2973,9 +2984,14 @@ plm_frame_t *plm_video_decode(plm_video_t *self) {
 		}
 	} while (!frame);
 	
-	frame->time = self->time;
-	self->frames_decoded++;
-	self->time = (double)self->frames_decoded / self->framerate;
+	#ifdef PLM_PRIME_INTEGER_VIDEO
+		frame->time = 0;
+		self->frames_decoded++;
+	#else
+		frame->time = self->time;
+		self->frames_decoded++;
+		self->time = (double)self->frames_decoded / self->framerate;
+	#endif
 	
 	return frame;
 }
@@ -3014,7 +3030,8 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 
 	// Get pixel aspect ratio
 	int pixel_aspect_ratio_code;
-	pixel_aspect_ratio_code = plm_buffer_read(self->buffer, 4);
+	self->aspect_code = plm_buffer_read(self->buffer, 4);
+	pixel_aspect_ratio_code = self->aspect_code;
 	pixel_aspect_ratio_code -= 1;
 	if (pixel_aspect_ratio_code < 0) {
 		pixel_aspect_ratio_code = 0;
@@ -3024,11 +3041,16 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 	if (pixel_aspect_ratio_code > par_last) {
 		pixel_aspect_ratio_code = par_last;
 	}
-	self->pixel_aspect_ratio =
-		PLM_VIDEO_PIXEL_ASPECT_RATIO[pixel_aspect_ratio_code];
+	#ifndef PLM_PRIME_INTEGER_VIDEO
+		self->pixel_aspect_ratio =
+			PLM_VIDEO_PIXEL_ASPECT_RATIO[pixel_aspect_ratio_code];
+	#endif
 
 	// Get frame rate
-	self->framerate = PLM_VIDEO_PICTURE_RATE[plm_buffer_read(self->buffer, 4)];
+	self->rate_code = plm_buffer_read(self->buffer, 4);
+	#ifndef PLM_PRIME_INTEGER_VIDEO
+		self->framerate = PLM_VIDEO_PICTURE_RATE[self->rate_code];
+	#endif
 
 	// Skip bit_rate, marker, buffer_size and constrained bit
 	plm_buffer_skip(self->buffer, 18 + 1 + 10 + 1);
@@ -3072,6 +3094,10 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 	size_t frame_data_size = (luma_plane_size + 2 * chroma_plane_size);
 
 	self->frames_data = (uint8_t*)PLM_MALLOC(frame_data_size * 3);
+	if (!self->frames_data) {
+		self->allocation_failed = TRUE;
+		return FALSE;
+	}
 	plm_video_init_frame(self, &self->frame_current, self->frames_data + frame_data_size * 0);
 	plm_video_init_frame(self, &self->frame_forward, self->frames_data + frame_data_size * 1);
 	plm_video_init_frame(self, &self->frame_backward, self->frames_data + frame_data_size * 2);

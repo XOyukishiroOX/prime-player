@@ -1,4 +1,4 @@
-"""Incremental MJPG and fixed-window MPEG-1 playback sessions."""
+"""Incremental MJPG and dynamic MPEG-1 playback sessions."""
 
 import ustruct as struct
 
@@ -9,7 +9,8 @@ import mpeg_stream_profile as mpeg_profile
 from mjpg_container import (HEADER_BYTES, MAX_FRAME_BYTES, MjpgError,
                             parse_header, validate_baseline_jpeg)
 from prime_video_io import NativeFile
-from prime_video_m1v import safe_seek_anchors
+from prime_video_m1v import (M1VFormatError, parse_sequence_header,
+                             safe_seek_anchors, scale_geometry)
 
 Error = native.Error
 FULL_CLIP = (0, 0, 319, 239)
@@ -17,7 +18,7 @@ ANCHOR_SCAN_BYTES = 512 * 1024
 
 
 class MjpgPlaybackSession:
-    def __init__(self, dbg, entry, emit=None):
+    def __init__(self, dbg, entry, emit=None, settings=None):
         self.dbg, self.entry = dbg, entry
         self.emit = emit or (lambda message, visible=True: None)
         self.decoder = None
@@ -28,6 +29,10 @@ class MjpgPlaybackSession:
         self.late_frames = 0
         self.current_frame = False
         self.video_bottom = 239
+        self.settings = settings
+        self.presented_frames = 0
+        self.dropped_frames = 0
+        self.display_fps_tenths = 0
 
     def start(self):
         self.decoder = prime_mjpeg_decoder.DecoderSession(self.dbg, self.emit)
@@ -69,7 +74,7 @@ class MjpgPlaybackSession:
             self.decoder.direct_used = True
             self.dbg.call("put", 0, 0, self.decoder.output_header, 0)
 
-    def next_frame(self):
+    def next_frame(self, present=True):
         if self.frames >= self.header.frame_count:
             self.file.verify_eof()
             return False
@@ -81,7 +86,8 @@ class MjpgPlaybackSession:
         validate_baseline_jpeg(data)
         self.decoder.decode_loaded_to_buffer(size)
         self.current_frame = True
-        self.present_current()
+        if present:
+            self.present_current()
         padding = (-size) & 3
         if padding:
             self.file.read_exact_to(self.decoder.input_address + size, padding)
@@ -172,7 +178,7 @@ class NativeModule:
 
 
 class M1VPlaybackSession:
-    def __init__(self, dbg, entry, emit=None):
+    def __init__(self, dbg, entry, emit=None, settings=None):
         self.dbg, self.entry = dbg, entry
         self.emit = emit or (lambda message, visible=True: None)
         self.images = None
@@ -187,6 +193,12 @@ class M1VPlaybackSession:
         self.position_bytes = 0
         self.current_frame = False
         self.video_bottom = 239
+        self.settings = settings
+        self.info = None
+        self.ring_storage_bytes = 0
+        self.presented_frames = 0
+        self.dropped_frames = 0
+        self.display_fps_tenths = 0
 
     def _guarded(self, size):
         image = self.images.create(256, (size + 95 + 1023) // 1024)
@@ -198,6 +210,12 @@ class M1VPlaybackSession:
 
     def start(self):
         import mpeg_stream_payload
+        if (mpeg_stream_payload.STAGING_BYTES != mpeg_profile.STAGING_BYTES or
+                mpeg_stream_payload.RING_BYTES != mpeg_profile.RING_BYTES or
+                mpeg_stream_payload.RING_STORAGE_BYTES not in
+                (mpeg_profile.RING_BYTES, mpeg_profile.RING_BYTES * 2)):
+            raise Error("MPEG_PAYLOAD_ABI_MISMATCH")
+        self.ring_storage_bytes = mpeg_stream_payload.RING_STORAGE_BYTES
         self.dbg.verify()
         active, real = self.dbg.call("active"), self.dbg.call("real")
         self.screen = native.read_lcd(self.dbg, active)
@@ -220,13 +238,24 @@ class M1VPlaybackSession:
                           mpeg_profile.GUARD)
 
         unused, self.staging = self._guarded(mpeg_profile.STAGING_BYTES)
-        unused, self.ring = self._guarded(mpeg_profile.RING_BYTES)
-        unused, self.arena = self._guarded(mpeg_profile.ARENA_BYTES)
+        unused, self.ring = self._guarded(self.ring_storage_bytes)
         context_image, self.context = self._guarded(mpeg_profile.CONTEXT_BYTES)
         code_image = self.images.create(
             256, (mpeg_stream_payload.MODULE_BYTES + 95 + 1023) // 1024)
         self.code = NativeModule(self.images, code_image, mpeg_stream_payload)
         self.saved = self.images.create(320, 240)
+
+        self.file = NativeFile(self.dbg, self.images, self.staging,
+                               mpeg_profile.STAGING_BYTES, self.entry)
+        self.file.open()
+        header_bytes = min(self.entry.size, mpeg_profile.STAGING_BYTES)
+        if header_bytes < 8:
+            raise M1VFormatError("MPEG_SEQUENCE_HEADER_TRUNCATED")
+        self.info = parse_sequence_header(self.file.read_small(header_bytes))
+        self.file.seek_absolute(0)
+        unused, self.arena = self._guarded(self.info.arena_bytes)
+        reserve = self.images.create(256, 256)
+        self.images.release_last(reserve)
 
         for offset in range(0, mpeg_profile.OUTPUT_BYTES, 4096):
             size = min(4096, mpeg_profile.OUTPUT_BYTES - offset)
@@ -237,30 +266,35 @@ class M1VPlaybackSession:
         words = [0] * mpeg_profile.RESULT_WORDS
         words[:9] = (mpeg_profile.CONTEXT_MAGIC, self.staging,
                      mpeg_profile.STAGING_BYTES, self.ring,
-                     mpeg_profile.RING_BYTES, self.output,
+                     self.ring_storage_bytes, self.output,
                      mpeg_profile.OUTPUT_BYTES, self.arena,
-                     mpeg_profile.ARENA_BYTES)
+                     self.info.arena_bytes)
         words[12] = mpeg_profile.RESULT_MAGIC
+        words[14:17] = (self.info.width, self.info.height,
+                        self.info.rate_code)
+        words[29] = self.info.aspect_code
+        words[30:38] = scale_geometry(
+            self.info, self.settings.scale if self.settings else "FIT")
+        words[40] = mpeg_profile.ABI_VERSION
+        words[41] = 1
         self.images.write(self.context,
                           struct.pack("<%dI" % len(words), *words))
         self._init_decoder()
-        self.file = NativeFile(self.dbg, self.images, self.staging,
-                               mpeg_profile.STAGING_BYTES, self.entry)
-        self.file.open()
 
     def _init_decoder(self):
-        result = self._command(mpeg_profile.COMMAND_INIT_STREAM)
-        words = self._context_words()
+        result, words = self._command(mpeg_profile.COMMAND_INIT_STREAM)
         if (result != mpeg_profile.SUCCESS or words[13] != 0 or
                 words[25] != mpeg_profile.STATE_MAGIC or not words[26] or
                 not words[27] or words[24] != 0):
+            if result == mpeg_profile.OUT_OF_MEMORY:
+                raise Error("MPEG_OUT_OF_MEMORY")
             raise Error("MPEG_INIT_FAILED 0x%x detail=%d" %
                         (result, words[39]))
         self.initialized = True
 
     @property
     def fps(self):
-        return 25, 1
+        return self.info.fps_num, self.info.fps_den
 
     @property
     def total_frames(self):
@@ -268,7 +302,8 @@ class M1VPlaybackSession:
 
     @property
     def source_ms(self):
-        return self.frames * 40
+        return (self.frames * 1000 * self.info.fps_den //
+                self.info.fps_num)
 
     @property
     def position_tenths(self):
@@ -277,13 +312,8 @@ class M1VPlaybackSession:
         return min(1000, self.position_bytes * 1000 // self.entry.size)
 
     def set_video_bottom(self, bottom):
-        if bottom not in (179, 217, 239):
+        if bottom != 239:
             raise Error("DISPLAY_CLIP_INVALID")
-        if bottom != self.video_bottom:
-            self.dbg.raw("clip", 0, 0, 319, bottom)
-            self.video_bottom = bottom
-            if self.current_frame:
-                self.present_current()
 
     def present_current(self):
         if self.current_frame:
@@ -297,14 +327,16 @@ class M1VPlaybackSession:
             raise Error("MPEG_CONTEXT_CORRUPTED")
         return words
 
-    def _command(self, command, feed_count=None, eof=None):
+    def _command(self, command, feed_count=None, eof=None, render=None):
         self.images.write(self.context + 9 * 4, struct.pack("<I", command))
         if feed_count is not None:
             self.images.write(self.context + 10 * 4,
                               struct.pack("<II", feed_count, int(bool(eof))))
+        if render is not None:
+            self.images.write(self.context + 41 * 4,
+                              struct.pack("<I", int(bool(render))))
         result = self.code.execute(self.context)
-        self._context_words()
-        return result
+        return result, self._context_words()
 
     def _feed(self):
         remaining = self.entry.size - self.file.position
@@ -314,19 +346,24 @@ class M1VPlaybackSession:
             final = self.file.position == self.entry.size
             if final:
                 self.file.verify_eof()
-            result = self._command(mpeg_profile.COMMAND_FEED, count, final)
+            result, words = self._command(
+                mpeg_profile.COMMAND_FEED, count, final)
             self.bytes_read = self.file.position
             self.eof_sent = final
         elif not self.eof_sent:
             self.file.verify_eof()
-            result = self._command(mpeg_profile.COMMAND_FEED, 0, True)
+            result, words = self._command(
+                mpeg_profile.COMMAND_FEED, 0, True)
             self.eof_sent = True
         else:
             raise Error("MPEG_REQUESTED_INPUT_AFTER_EOF")
         if result == mpeg_profile.RING_OVERFLOW:
             raise Error("MPEG_COMPRESSED_WINDOW_EXCEEDS_128_KIB")
+        if result == mpeg_profile.OUT_OF_MEMORY:
+            raise Error("MPEG_OUT_OF_MEMORY")
         if result != mpeg_profile.SUCCESS:
-            raise Error("MPEG_FEED_FAILED 0x%x" % result)
+            raise Error("MPEG_FEED_FAILED 0x%x detail=%d" %
+                        (result, words[39]))
 
     def _update_position(self, words):
         consumed = words[19]
@@ -366,9 +403,10 @@ class M1VPlaybackSession:
 
     def _restart_at(self, anchor):
         if self.initialized:
-            result = self._command(mpeg_profile.COMMAND_RESET)
+            result, words = self._command(mpeg_profile.COMMAND_RESET)
             if result != mpeg_profile.SUCCESS:
-                raise Error("MPEG_RESET_FAILED 0x%x" % result)
+                raise Error("MPEG_RESET_FAILED 0x%x detail=%d" %
+                            (result, words[39]))
             self.initialized = False
         self._init_decoder()
         self.file.seek_absolute(anchor)
@@ -381,8 +419,8 @@ class M1VPlaybackSession:
 
     def next_frame(self, present=True):
         while True:
-            result = self._command(mpeg_profile.COMMAND_NEXT_2X2)
-            words = self._context_words()
+            result, words = self._command(
+                mpeg_profile.COMMAND_NEXT, render=present)
             if result == mpeg_profile.FRAME_READY:
                 self.frames = words[17]
                 self._update_position(words)
@@ -395,12 +433,8 @@ class M1VPlaybackSession:
                 continue
             if result == mpeg_profile.END_OF_STREAM:
                 return False
-            if result == mpeg_profile.UNSUPPORTED and words[39] == 6:
-                fps = words[16]
-                raise Error(
-                    "MPEG_UNSUPPORTED expected=320x240@25 "
-                    "actual=%dx%d@%d.%03d" %
-                    (words[14], words[15], fps // 1000, fps % 1000))
+            if result == mpeg_profile.OUT_OF_MEMORY:
+                raise Error("MPEG_OUT_OF_MEMORY")
             raise Error("MPEG_DECODE_FAILED code=0x%x detail=%d" %
                         (result, words[39]))
 
@@ -410,9 +444,17 @@ class M1VPlaybackSession:
         target = self.entry.size * tenths // 1000
         anchor = self._find_anchor(target)
         self._restart_at(anchor)
-        while self.position_bytes < target:
+        decoded = False
+        while self.position_bytes < target or not decoded:
             if not self.next_frame(False):
                 break
+            decoded = True
+        if not decoded:
+            raise Error("MPEG_SEEK_NO_FRAME")
+        result, words = self._command(mpeg_profile.COMMAND_RENDER)
+        if result != mpeg_profile.FRAME_READY:
+            raise Error("MPEG_RENDER_FAILED code=0x%x detail=%d" %
+                        (result, words[39]))
         self.present_current()
         return self.position_tenths
 
@@ -420,9 +462,10 @@ class M1VPlaybackSession:
         errors = []
         if self.initialized:
             try:
-                result = self._command(mpeg_profile.COMMAND_RESET)
+                result, words = self._command(mpeg_profile.COMMAND_RESET)
                 if result != mpeg_profile.SUCCESS:
-                    raise Error("MPEG_RESET_FAILED 0x%x" % result)
+                    raise Error("MPEG_RESET_FAILED 0x%x detail=%d" %
+                                (result, words[39]))
             except BaseException as exc:
                 errors.append(str(exc))
             self.initialized = False
