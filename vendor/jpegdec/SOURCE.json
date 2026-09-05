@@ -1,0 +1,20 @@
+{
+  "url": "https://github.com/bitbank2/JPEGDEC/archive/86282979224c8a32fd51e091ed5a35b0c699a52b.tar.gz",
+  "commit": "86282979224c8a32fd51e091ed5a35b0c699a52b",
+  "archive_bytes": 2405952,
+  "archive_sha256": "ce1cb7641c64a338f1f8599ddde2335e9c00b80fafe580eaf3841fb7269a434b",
+  "files": {
+    "LICENSE": {
+      "bytes": 11414,
+      "sha256": "16b742c2110129c89df82164a28dbecb7ca1fe100c75c30e5c506f050c0c6de5"
+    },
+    "src/jpeg.inl": {
+      "bytes": 246671,
+      "sha256": "34c6eb16b56b9ee86108b8ca22ac42bbdf0c31bc3bb4ceb61f844f9ee344e2a9"
+    },
+    "src/JPEGDEC.h": {
+      "bytes": 12060,
+      "sha256": "ebb0b79d627d9585e1b985c29a85ea19f9b78e69c6235e2a8e95daed3030e402"
+    }
+  }
+}

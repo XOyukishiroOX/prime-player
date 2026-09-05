@@ -1,0 +1,8 @@
+{
+  "project": "phoboslab/pl_mpeg",
+  "commit": "c871f2be022ece7ef4f64230b4fb8e1fb9eb6023",
+  "source_sha256": "3a8cb30c83c2a1147719c30fe0c8b93da2987aa43140077c575b39aaa75fc2c9",
+  "source_bytes": 141424,
+  "license": "MIT (SPDX-License-Identifier: MIT in source)",
+  "scope": "MPEG-1 video and MPEG-PS demux only; audio disabled in this probe"
+}

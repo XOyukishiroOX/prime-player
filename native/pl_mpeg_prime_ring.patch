@@ -1,0 +1,172 @@
+diff --git a/vendor/pl_mpeg/pl_mpeg.h b/vendor/pl_mpeg/pl_mpeg.h
+--- a/vendor/pl_mpeg/pl_mpeg.h
++++ b/vendor/pl_mpeg/pl_mpeg.h
+@@ -1386,6 +1386,8 @@ struct plm_buffer_t {
+ 	size_t capacity;
+ 	size_t length;
+ 	size_t total_size;
++	size_t ring_start;
++	size_t ring_base_offset;
+ 	int discard_read_bytes;
+ 	int has_ended;
+ 	int free_when_done;
+@@ -1423,6 +1425,7 @@ size_t plm_buffer_tell_file_callback(plm_buffer_t *self, void *user);
+ #endif
+ 
+ int plm_buffer_has(plm_buffer_t *self, size_t count);
++uint8_t plm_buffer_byte_at(plm_buffer_t *self, size_t index);
+ int plm_buffer_read(plm_buffer_t *self, int count);
+ void plm_buffer_align(plm_buffer_t *self);
+ void plm_buffer_skip(plm_buffer_t *self, size_t count);
+@@ -1523,6 +1526,11 @@ void plm_buffer_destroy(plm_buffer_t *self) {
+ }
+ 
+ size_t plm_buffer_get_size(plm_buffer_t *self) {
++	if (self->mode == PLM_BUFFER_MODE_RING) {
++		return self->total_size
++			? self->total_size
++			: self->ring_base_offset + self->length;
++	}
+ 	return (self->mode == PLM_BUFFER_MODE_FILE)
+ 		? self->total_size
+ 		: self->length;
+@@ -1536,6 +1544,28 @@ size_t plm_buffer_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
+ 	if (self->mode == PLM_BUFFER_MODE_FIXED_MEM) {
+ 		return 0;
+ 	}
++	if (self->mode == PLM_BUFFER_MODE_RING) {
++		plm_buffer_discard_read_bytes(self);
++		if (length > self->capacity - self->length) {
++			return 0;
++		}
++
++		size_t write_at = self->ring_start + self->length;
++		if (write_at >= self->capacity) {
++			write_at -= self->capacity;
++		}
++		size_t first = self->capacity - write_at;
++		if (first > length) {
++			first = length;
++		}
++		memcpy(self->bytes + write_at, bytes, first);
++		if (length > first) {
++			memcpy(self->bytes, bytes + first, length - first);
++		}
++		self->length += length;
++		self->has_ended = FALSE;
++		return length;
++	}
+ 
+ 	if (self->discard_read_bytes) {
+ 		// This should be a ring buffer, but instead it just shifts all unread 
+@@ -1566,7 +1596,9 @@ size_t plm_buffer_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
+ }
+ 
+ void plm_buffer_signal_end(plm_buffer_t *self) {
+-	self->total_size = self->length;
++	self->total_size = self->mode == PLM_BUFFER_MODE_RING
++		? self->ring_base_offset + self->length
++		: self->length;
+ }
+ 
+ void plm_buffer_set_load_callback(plm_buffer_t *self, plm_buffer_load_callback fp, void *user) {
+@@ -1594,6 +1626,8 @@ void plm_buffer_seek(plm_buffer_t *self, size_t pos) {
+ 		self->bit_index = 0;
+ 		self->length = 0;
+ 		self->total_size = 0;
++		self->ring_start = 0;
++		self->ring_base_offset = 0;
+ 	}
+ 	else if (pos < self->length) {
+ 		self->bit_index = pos << 3;
+@@ -1601,6 +1635,9 @@ void plm_buffer_seek(plm_buffer_t *self, size_t pos) {
+ }
+ 
+ size_t plm_buffer_tell(plm_buffer_t *self) {
++	if (self->mode == PLM_BUFFER_MODE_RING) {
++		return self->ring_base_offset + (self->bit_index >> 3);
++	}
+ 	return self->tell_callback
+ 		? self->tell_callback(self, self->load_callback_user_data) + (self->bit_index >> 3) - self->length
+ 		: self->bit_index >> 3;
+@@ -1608,6 +1645,16 @@ size_t plm_buffer_tell(plm_buffer_t *self) {
+ 
+ void plm_buffer_discard_read_bytes(plm_buffer_t *self) {
+ 	size_t byte_pos = self->bit_index >> 3;
++	if (self->mode == PLM_BUFFER_MODE_RING && byte_pos > 0) {
++		self->ring_start += byte_pos;
++		if (self->ring_start >= self->capacity) {
++			self->ring_start -= self->capacity;
++		}
++		self->ring_base_offset += byte_pos;
++		self->bit_index -= byte_pos << 3;
++		self->length -= byte_pos;
++		return;
++	}
+ 	if (byte_pos == self->length) {
+ 		self->bit_index = 0;
+ 		self->length = 0;
+@@ -1666,12 +1713,26 @@ int plm_buffer_has(plm_buffer_t *self, size_t count) {
+ 		}
+ 	}	
+ 	
+-	if (self->total_size != 0 && self->length == self->total_size) {
++	if (self->total_size != 0 &&
++		(self->mode == PLM_BUFFER_MODE_RING
++			? self->ring_base_offset + self->length == self->total_size
++			: self->length == self->total_size)) {
+ 		self->has_ended = TRUE;
+ 	}
+ 	return FALSE;
+ }
+ 
++uint8_t plm_buffer_byte_at(plm_buffer_t *self, size_t index) {
++	if (self->mode == PLM_BUFFER_MODE_RING) {
++		size_t physical = self->ring_start + index;
++		if (physical >= self->capacity) {
++			physical -= self->capacity;
++		}
++		return self->bytes[physical];
++	}
++	return self->bytes[index];
++}
++
+ int plm_buffer_read(plm_buffer_t *self, int count) {
+ 	if (!plm_buffer_has(self, count)) {
+ 		return 0;
+@@ -1679,7 +1740,7 @@ int plm_buffer_read(plm_buffer_t *self, int count) {
+ 
+ 	int value = 0;
+ 	while (count) {
+-		int current_byte = self->bytes[self->bit_index >> 3];
++		int current_byte = plm_buffer_byte_at(self, self->bit_index >> 3);
+ 
+ 		int remaining = 8 - (self->bit_index & 7); // Remaining bits in byte
+ 		int read = remaining < count ? remaining : count; // Bits in self run
+@@ -1708,7 +1769,8 @@ void plm_buffer_skip(plm_buffer_t *self, size_t count) {
+ int plm_buffer_skip_bytes(plm_buffer_t *self, uint8_t v) {
+ 	plm_buffer_align(self);
+ 	int skipped = 0;
+-	while (plm_buffer_has(self, 8) && self->bytes[self->bit_index >> 3] == v) {
++	while (plm_buffer_has(self, 8) &&
++		plm_buffer_byte_at(self, self->bit_index >> 3) == v) {
+ 		self->bit_index += 8;
+ 		skipped++;
+ 	}
+@@ -1721,12 +1783,12 @@ int plm_buffer_next_start_code(plm_buffer_t *self) {
+ 	while (plm_buffer_has(self, (5 << 3))) {
+ 		size_t byte_index = (self->bit_index) >> 3;
+ 		if (
+-			self->bytes[byte_index] == 0x00 &&
+-			self->bytes[byte_index + 1] == 0x00 &&
+-			self->bytes[byte_index + 2] == 0x01
++			plm_buffer_byte_at(self, byte_index) == 0x00 &&
++			plm_buffer_byte_at(self, byte_index + 1) == 0x00 &&
++			plm_buffer_byte_at(self, byte_index + 2) == 0x01
+ 		) {
+ 			self->bit_index = (byte_index + 4) << 3;
+-			return self->bytes[byte_index + 3];
++			return plm_buffer_byte_at(self, byte_index + 3);
+ 		}
+ 		self->bit_index += 8;
+ 	}
