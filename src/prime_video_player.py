@@ -1,4 +1,4 @@
-"""PrimeVideoPlayer 1.1.0 application state machine and resource ownership."""
+"""PrimeVideoPlayer 1.1.1 application state machine and resource ownership."""
 
 import sys
 import prime_native as native
@@ -17,7 +17,7 @@ Error = native.Error
 class PlayerLog(native.RunLog):
     def __init__(self, path="prime_video_player.log"):
         native.RunLog.__init__(
-            self, path, "PrimeVideoPlayer 1.1.0 G1/2025-09-15")
+            self, path, "PrimeVideoPlayer 1.1.1 G1/2025-09-15")
 
 
 class PrimeVideoPlayer:
@@ -89,6 +89,8 @@ class PrimeVideoPlayer:
             remembered = self.positions.get(entry)
             if remembered:
                 actual = self.session.seek_tenths(remembered)
+                self.screen.video_frame_updated()
+                self.screen.playback(entry, self.session, model, False)
                 self.emit("PLAY_RESUME %s requested=%d actual=%d" %
                           (entry.name, remembered, actual), False)
             fps_num, fps_den = self.session.fps
@@ -177,6 +179,9 @@ class PrimeVideoPlayer:
             model.seek_target = None
             self._new_clock(model)
             self._save_current_position(model)
+            self.screen.video_frame_updated()
+            self.screen.playback(model.files[model.index], self.session, model,
+                                 model.state == PlayerState.PAUSED)
         elif action in ("STOP", "SWITCH"):
             self._save_current_position(model)
         return action
@@ -201,7 +206,7 @@ class PrimeVideoPlayer:
                 return model.finished()
             if present:
                 self.screen.video_frame_updated()
-            self.screen.playback(entry, self.session, model, False)
+                self.screen.playback(entry, self.session, model, False)
             render_end = ticks_ms()
             render_ms = render_end - render_start
             if render_ms < 0:

@@ -41,6 +41,8 @@ prime_video_positions.dat
 !/src/prime_video_runtime.py
 !/src/prime_video_sessions.py
 !/src/prime_video_settings.py
+!/src/prime_video_compositor.py
+!/src/prime_video_grob_profile.py
 /tests/*
 !/tests/fixtures/
 !/tests/fixtures/**

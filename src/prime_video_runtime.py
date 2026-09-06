@@ -6,6 +6,7 @@ from prime_video_i18n import text as tr
 import prime_video_profile as profile
 from prime_video_model import DebugMode, PlayerState
 from prime_video_settings import SETTING_KEYS
+from prime_video_compositor import FrameCompositor
 
 Error = native.Error
 struct = native.struct
@@ -146,8 +147,69 @@ class ScreenAwake:
         self.last_refresh = None
 
 
+class ListTextCanvas:
+    """Clip complete filenames to an actual 214 x 16 pixel image, not characters."""
+
+    def __init__(self, bridge=None):
+        self.bridge = bridge
+        self.images = None
+        self.canvas = None
+        self.original_clip = None
+
+    def start(self):
+        if self.bridge is None:
+            self.bridge = PlayerBridge(native.uio.FileIO("debug"))
+        self.bridge.verify()
+        active = self.bridge.call("active")
+        screen = native.read_lcd(self.bridge, active)
+        if active != self.bridge.call("real") or screen[5] != 32:
+            raise Error("UNEXPECTED_LCD_CONTEXT")
+        self.images = native.OwnedImages(self.bridge, active, screen)
+        self.canvas = FrameCompositor(self.images, 214, 16)
+        self.canvas.start()
+        self.original_clip = native.clip_area(self.bridge, active)
+        self.bridge.raw("clip", 0, 0, 319, 239)
+
+    def draw(self, value, x, y, color, background):
+        value = str(value).replace("\r", " ").replace("\n", " ")
+        target = self.canvas.bind()
+        try:
+            hpprime.fillrect(target, 0, 0, 214, 16, background, background)
+            hpprime.textout(target, 0, 0, value, color)
+        finally:
+            self.canvas.end()
+        self.canvas.present(x, y)
+
+    def close(self):
+        errors = []
+        if self.canvas is not None:
+            try:
+                self.canvas.close()
+            except BaseException as exc:
+                errors.append(str(exc))
+        if self.original_clip is not None:
+            try:
+                self.bridge.raw("clip", *self.original_clip)
+                if native.clip_area(self.bridge, self.images.active) != self.original_clip:
+                    raise Error("LIST_TEXT_CLIP_RESTORE_MISMATCH")
+            except BaseException as exc:
+                errors.append(str(exc))
+        if self.images is not None and not (self.canvas and self.canvas.bound):
+            errors.extend(self.images.release())
+        if self.bridge is not None:
+            bridge, self.bridge = self.bridge, None
+            try:
+                bridge.close()
+            except BaseException as exc:
+                errors.append(str(exc))
+        if errors:
+            raise Error("LIST_TEXT_CLEANUP_FAILED: " + "; ".join(errors))
+
+
 class PlayerScreen:
-    def __init__(self):
+    def __init__(self, text_canvas_factory=None):
+        self._text_canvas_factory = text_canvas_factory or ListTextCanvas
+        self._target = 0
         self._view = None
         self._signature = None
         self._play_mode = None
@@ -170,13 +232,14 @@ class PlayerScreen:
         value = str(value).replace("\r", " ").replace("\n", " ")
         height = min(height, 240 - y)
         if clear_background and width > 0 and height > 0:
-            hpprime.fillrect(0, x, y, width, height, background, background)
-        hpprime.textout(0, x, y, value, color)
+            hpprime.fillrect(self._target, x, y, width, height, background, background)
+        hpprime.textout(self._target, x, y, value, color)
 
     def clear(self, color=None):
         if color is None:
             color = self.palette()[0]
         hpprime.fillrect(0, 0, 0, 320, 240, color, color)
+        self._target = 0
         self._view = None
         self._signature = None
         self._play_mode = None
@@ -185,14 +248,14 @@ class PlayerScreen:
         self._frame_updated = False
 
     def video_frame_updated(self):
-        # A decoded frame can overwrite the panel even when its text is unchanged.
+        # A fresh RGB frame needs a new composition even if its text is unchanged.
         self._play_lines = [None, None, None, None]
         self._fps_line = None
         self._frame_updated = True
 
     @staticmethod
     def video_bottom(debug_mode):
-        # Overlays are drawn after presentation, on top of the full video.
+        # Video and overlays share the full offscreen composition.
         return 239
 
     def list(self, model):
@@ -209,7 +272,7 @@ class PlayerScreen:
             self.clear(background)
         else:
             hpprime.fillrect(0, 0, 0, 320, 218, background, background)
-        self.text("PrimeVideoPlayer 1.1.0", 10, 5, accent, 300, background)
+        self.text("PrimeVideoPlayer 1.1.1", 10, 5, accent, 300, background)
         self.text(tr(self.language, "files", len(model.files)), 10, 23,
                   muted, 300, background)
         hpprime.fillrect(0, 6, 38, 308, 176, card, card)
@@ -218,20 +281,24 @@ class PlayerScreen:
                       card)
             self._view, self._signature = "LIST", signature
         else:
-            for row, index in enumerate(range(first, min(first + 9,
-                                                          len(model.files)))):
-                entry = model.files[index]
-                chosen = index == model.selected
-                y = 42 + row * 19
-                row_background = selection if chosen else card
-                hpprime.fillrect(0, 9, y, 302, 18, row_background,
-                                 row_background)
-                size_kib = (entry.size + 1023) // 1024
-                self.text(entry.name[:23], 14, y + 1,
-                          foreground, 214, row_background, False, 16)
-                self.text("%s %dK" % (entry.extension[1:], size_kib),
-                          232, y + 1, accent if chosen else muted, 76,
-                          row_background, False, 16)
+            canvas = self._text_canvas_factory()
+            try:
+                canvas.start()
+                for row, index in enumerate(range(first, min(first + 9,
+                                                              len(model.files)))):
+                    entry = model.files[index]
+                    chosen = index == model.selected
+                    y = 42 + row * 19
+                    row_background = selection if chosen else card
+                    hpprime.fillrect(0, 9, y, 302, 18, row_background,
+                                     row_background)
+                    size_kib = (entry.size + 1023) // 1024
+                    canvas.draw(entry.name, 14, y + 1, foreground, row_background)
+                    self.text("%s %dK" % (entry.extension[1:], size_kib),
+                              232, y + 1, accent if chosen else muted, 76,
+                              row_background, False, 16)
+            finally:
+                canvas.close()
         footer = tr(self.language, "list_help")
         self.text(footer, 6, 222, muted, 308, background)
         self._view, self._signature = "LIST", signature
@@ -264,102 +331,85 @@ class PlayerScreen:
     def playback(self, entry, session, model, paused=False):
         self.language, self.theme = (model.settings.language,
                                      model.settings.theme)
-        background, card, foreground, muted, accent, selection, danger = self.palette()
         debug_mode = model.debug_mode
         session.set_video_bottom(self.video_bottom(debug_mode))
-        mode_changed = (self._view != "PLAYBACK" or
-                        self._play_mode != debug_mode)
-        if mode_changed:
-            if (self._view == "PLAYBACK" and not self._frame_updated and
-                    getattr(session, "current_frame", False)):
-                session.present_current()
-            self._play_lines = [None, None, None, None]
-            self._fps_line = None
-            self._play_mode = debug_mode
-        self._view = "PLAYBACK"
-        self._signature = None
-        if debug_mode == DebugMode.OFF:
-            self._frame_updated = False
+        if not session.current_frame:
             return
-
-        # A skipped decode must not cause an overlay-only screen update. The
-        # next successfully presented frame will refresh both video and text.
-        if (not self._frame_updated and not mode_changed and
-                model.state == PlayerState.PLAYING):
-            return
-
+        # The player never calls this for a skipped playing frame. Paused and
+        # seeking views may update independently, always from a clean RGB frame.
         position = (model.seek_target if model.state == PlayerState.SEEKING
                     else session.position_tenths)
         fps_tenths = (0 if paused or model.state == PlayerState.SEEKING else
                       getattr(session, "display_fps_tenths", 0))
+        signature = (entry.name, debug_mode, model.state, position, fps_tenths,
+                     session.frames, session.bytes_read, session.late_frames,
+                     model.mode, self.language, self.theme)
+        if (self._view == "PLAYBACK" and self._signature == signature and
+                not self._frame_updated):
+            return
+        if debug_mode == DebugMode.OFF:
+            # With no overlay there is no intermediate UI state to expose.
+            session.present_current()
+        else:
+            self._target = session.begin_composition()
+            try:
+                self._draw_overlay(entry, session, model, paused,
+                                   position, fps_tenths)
+            finally:
+                self._target = 0
+                session.end_composition()
+            # No physical screen write is permitted until all UI is complete.
+            session.present_composition()
+        self._view = "PLAYBACK"
+        self._play_mode = debug_mode
+        self._signature = signature
+        self._frame_updated = False
+
+    def _draw_overlay(self, entry, session, model, paused, position, fps_tenths):
+        background, card, foreground, muted, accent, selection, danger = self.palette()
         fps_line = "FPS:%d.%d" % (fps_tenths // 10, fps_tenths % 10)
-        if debug_mode == DebugMode.PROGRESS:
-            signature = (position, model.state, fps_line)
-            if (self._play_lines[0] == signature and
-                    self._fps_line == fps_line):
-                self._frame_updated = False
-                return
-            if (not self._frame_updated and
-                    getattr(session, "current_frame", False)):
-                session.present_current()
-            hpprime.fillrect(0, 6, 218, 308, 4, muted, muted)
+        if model.debug_mode == DebugMode.PROGRESS:
+            hpprime.fillrect(self._target, 6, 218, 308, 4, muted, muted)
             width = position * 308 // 1000
             if width:
-                hpprime.fillrect(0, 6, 218, width, 4, accent, accent)
+                hpprime.fillrect(self._target, 6, 218, width, 4, accent, accent)
             label = ((tr(self.language, "seeking") + " %d.%d%%")
                      if model.state == PlayerState.SEEKING
                      else "%d.%d%%") % (position // 10, position % 10)
             self.text(label, 6, 224, foreground, 308, background, False, 15)
-            fps_x = max(246, 316 - len(fps_line) * 8)
-            self.text(fps_line, fps_x, 2, 0xFFFFFF, 320 - fps_x,
-                      background, False, 15)
-            self._play_lines[0] = signature
-            self._fps_line = fps_line
-            self._frame_updated = False
-            return
-
-        total = session.total_frames
-        frame_text = ("%d/%d" % (session.frames, total) if total is not None
-                      else "%d" % session.frames)
-        if model.state == PlayerState.SEEKING:
-            status = tr(self.language, "seek_help", position // 10,
-                        position % 10)
         else:
-            status = tr(self.language, "play_help",
-                tr(self.language, "pause") if paused else
-                tr(self.language, "playing"), tr(self.language, model.mode),
-                tr(self.language, "play") if paused else
-                tr(self.language, "pause"))
-        presented = getattr(session, "presented_frames", session.frames)
-        dropped = getattr(session, "dropped_frames", 0)
-        lines = (
-            entry.name[:39],
-            tr(self.language, "detail_time", entry.extension[1:], frame_text,
-               session.source_ms),
-            tr(self.language, "detail_stats",
-               (session.bytes_read + 1023) // 1024,
-               (entry.size + 1023) // 1024, position // 10, position % 10,
-               session.late_frames, presented, dropped),
-            status[:39],
-        )
-        colors = (foreground, foreground, foreground, accent)
-        if (self._fps_line != fps_line and not self._frame_updated and
-                getattr(session, "current_frame", False)):
-            session.present_current()
-            self._play_lines = [None, None, None, None]
-        for row, line in enumerate(lines):
-            if self._play_lines[row] == line:
-                continue
-            y = 180 + row * 15
-            hpprime.fillrect(0, 0, y, 320, 15, background, background)
-            self.text(line, 3, y, colors[row], 314, background, False, 15)
-            self._play_lines[row] = line
-        if self._fps_line != fps_line:
-            fps_x = max(246, 316 - len(fps_line) * 8)
-            self.text(fps_line, fps_x, 2, 0xFFFFFF, 320 - fps_x,
-                      background, False, 15)
-            self._fps_line = fps_line
-        self._frame_updated = False
+            total = session.total_frames
+            frame_text = ("%d/%d" % (session.frames, total) if total is not None
+                          else "%d" % session.frames)
+            if model.state == PlayerState.SEEKING:
+                status = tr(self.language, "seek_help", position // 10,
+                            position % 10)
+            else:
+                status = tr(self.language, "play_help",
+                    tr(self.language, "pause") if paused else
+                    tr(self.language, "playing"), tr(self.language, model.mode),
+                    tr(self.language, "play") if paused else
+                    tr(self.language, "pause"))
+            presented = getattr(session, "presented_frames", session.frames)
+            dropped = getattr(session, "dropped_frames", 0)
+            lines = (
+                entry.name[:39],
+                tr(self.language, "detail_time", entry.extension[1:], frame_text,
+                   session.source_ms),
+                tr(self.language, "detail_stats",
+                   (session.bytes_read + 1023) // 1024,
+                   (entry.size + 1023) // 1024, position // 10, position % 10,
+                   session.late_frames, presented, dropped),
+                status[:39],
+            )
+            colors = (foreground, foreground, foreground, accent)
+            for row, line in enumerate(lines):
+                y = 180 + row * 15
+                hpprime.fillrect(self._target, 0, y, 320, 15, background, background)
+                self.text(line, 3, y, colors[row], 314, background, False, 15)
+        fps_x = max(246, 316 - len(fps_line) * 8)
+        self.text(fps_line, fps_x, 2, 0xFFFFFF, 320 - fps_x,
+                  background, False, 15)
 
     def error(self, message):
         signature = str(message)

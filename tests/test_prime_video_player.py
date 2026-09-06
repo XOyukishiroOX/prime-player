@@ -20,10 +20,15 @@ host_hpprime = types.SimpleNamespace(
 with patch.dict(sys.modules, {
         "ustruct": struct,
         "uio": types.SimpleNamespace(),
+        "mjpeg_decoder_payload": types.SimpleNamespace(),
         "hpprime": host_hpprime}):
     import prime_native as native_runtime
     import prime_video_profile as profile
     import prime_video_runtime as runtime
+    import prime_video_compositor as compositor_runtime
+    import prime_video_grob_profile as grob_profile
+    import prime_video_sessions as sessions
+    import prime_video_player as player_runtime
     from mjpg_container import (MjpgError, MjpgReader, parse_bytes,
                                 validate_baseline_jpeg)
     from prime_video_clock import FrameClock
@@ -141,6 +146,45 @@ class FakeImages:
     def trusted(self, address, size):
         if address != MemoryDevice.HANDLE or size != 0x2C:
             raise AssertionError("unexpected handle")
+
+
+class CompositionSession:
+    current_frame = True
+    total_frames = None
+    frames = 12
+    source_ms = 480
+    bytes_read = 524288
+    late_frames = 0
+    display_fps_tenths = 247
+    position_tenths = 125
+    present_calls = 0
+    composition_calls = 0
+
+    def set_video_bottom(self, bottom):
+        self.bottom = bottom
+
+    def begin_composition(self):
+        return 9
+
+    def end_composition(self):
+        pass
+
+    def present_composition(self):
+        self.composition_calls += 1
+
+    def present_current(self):
+        self.present_calls += 1
+
+
+class RecordingTextCanvas:
+    def start(self):
+        pass
+
+    def draw(self, value, x, y, color, background):
+        runtime.hpprime.textout(9, x, y, value, color)
+
+    def close(self):
+        pass
 
 
 class FileDiscoveryTests(unittest.TestCase):
@@ -528,7 +572,7 @@ class DirectHpPrimeRuntimeTests(unittest.TestCase):
         model = PlayerModel([FileEntry("movie.M1V", "movie.M1V", ".M1V",
                                        1024 * 1024)])
         with patch.object(runtime, "hpprime", direct):
-            screen = runtime.PlayerScreen()
+            screen = runtime.PlayerScreen(text_canvas_factory=RecordingTextCanvas)
             screen.list(model)
             self.assertEqual(fills[0], (0, 0, 0, 320, 240,
                                         runtime.LIST_BACKGROUND,
@@ -537,7 +581,7 @@ class DirectHpPrimeRuntimeTests(unittest.TestCase):
             screen.list(model)
             self.assertEqual(len(fills) + len(texts), draw_count)
 
-            class Session:
+            class Session(CompositionSession):
                 total_frames = None
                 frames = 12
                 source_ms = 480
@@ -580,7 +624,7 @@ class DirectHpPrimeRuntimeTests(unittest.TestCase):
         model.state = PlayerState.PLAYING
         model.debug_mode = DebugMode.PROGRESS
 
-        class Session:
+        class Session(CompositionSession):
             position_tenths = 125
             display_fps_tenths = 247
             current_frame = True
@@ -604,12 +648,329 @@ class DirectHpPrimeRuntimeTests(unittest.TestCase):
             texts[:] = []
             model.state = PlayerState.PAUSED
             screen.playback(model.files[0], session, model, paused=True)
-            self.assertEqual(session.present_calls, 1)
+            self.assertEqual(session.present_calls, 0)
+            self.assertEqual(session.composition_calls, 2)
+            self.assertTrue(all(call[0] == 9 for call in fills + texts))
             self.assertIn("FPS:0.0", [call[3] for call in texts])
 
             model.debug_mode = DebugMode.OFF
             screen.playback(model.files[0], session, model, paused=True)
-            self.assertEqual(session.present_calls, 2)
+            self.assertEqual(session.present_calls, 1)
+
+
+class CompositorDevice(MemoryDevice):
+    def __init__(self):
+        super().__init__()
+        self.verified = True
+        self.next_heap = 0x31100000
+        self.presentations = []
+        self.freed = []
+        self.presentation_rectangles = []
+        self.text_calls = []
+        self.closed = 0
+        self.active = 0x3012CBC8
+        self.store(self.active, bytes(256))
+        self.store(self.active, struct.pack("<III", 0x3012CCC8,
+                                          0x31E80000 + 307200, 307200))
+        self.store(0x3012CCC8, struct.pack("<2shhhhhII", b"PX", 320, 240,
+                                         32, 1280, 2, 0, 0x31E80000))
+        self.store(self.active + 0x6C, struct.pack("<4h", 2, 3, 315, 236))
+        self.original_grob = 0x31008000
+        self.store(self.original_grob, b"original G9 remains intact")
+        self.store(grob_profile.GROB_SLOT, struct.pack("<I", self.original_grob))
+        for address, data in grob_profile.CHECKS:
+            self.store(address, data)
+
+    def packet(self, packet):
+        command, address, value = struct.unpack("<III", packet)
+        assert command == 1
+        self.store(address, struct.pack("<I", value))
+
+    def verify(self):
+        self.verified = True
+
+    def close(self):
+        self.closed += 1
+
+    def raw(self, name, *args):
+        if name == "clip":
+            self.store(self.active + 0x6C, struct.pack("<4h", *args))
+            return 0
+        return super().raw(name, *args)
+
+    def invoke(self, address, args):
+        assert address == grob_profile.COPY_ADDRESS
+        dst, src, count = args
+        self.store(dst, self.read(src, count))
+        return dst
+
+    def call(self, name, *args):
+        if name in ("active", "real"):
+            return self.active
+        if name == "create":
+            active, width, height = args
+            address = self.next_heap
+            self.next_heap += (width * height * 4 + 20 + 4095) & ~4095
+            self.store(address, struct.pack("<2shhhhhII", b"PX", width, height,
+                       32, width * 4, 2, 0, address + 20) +
+                       bytes(width * height * 4))
+            return address
+        if name == "put":
+            assert self.read(grob_profile.GROB_SLOT, 4) == struct.pack(
+                "<I", self.original_grob), "G9 must be restored before presentation"
+            pixels = struct.unpack("<I", self.read(args[2] + 16, 4))[0]
+            width, height = struct.unpack("<2h", self.read(args[2] + 2, 4))
+            self.presentations.append(self.read(pixels, width * height * 4))
+            self.presentation_rectangles.append((args[0], args[1], width, height))
+            return 0
+        if name == "free":
+            self.freed.append(args[0])
+            return 0
+        raise AssertionError(name)
+
+    def fillrect(self, grob, x, y, width, height, color, background):
+        assert grob == 9, "playback must never draw directly to G0"
+        obj = struct.unpack("<I", self.read(grob_profile.GROB_SLOT, 4))[0]
+        pixels = struct.unpack("<I", self.read(obj + 20, 4))[0]
+        canvas_width, canvas_height = struct.unpack("<2I", self.read(obj + 12, 8))
+        for row in range(y, min(canvas_height, y + height)):
+            self.store(pixels + (row * canvas_width + x) * 4,
+                       struct.pack("<I", color) * min(width, canvas_width - x))
+
+    def textout(self, grob, x, y, text, color):
+        # A marker rectangle stands in for glyphs; actual firmware rasterization
+        # and GROB routing are exercised separately under ARM emulation.
+        self.text_calls.append(text)
+        width = sum(16 if ord(c) > 127 else (3 if c == "i" else 8) for c in text)
+        self.fillrect(grob, x, y, width, 8, color, color)
+
+
+class CompositorTests(unittest.TestCase):
+    def test_filename_canvas_clips_by_pixels_and_clears_previous_row(self):
+        device = CompositorDevice()
+        canvas = runtime.ListTextCanvas(device)
+        original_clip = native_runtime.clip_area(device, device.active)
+        with patch.object(runtime, "hpprime", device):
+            try:
+                canvas.start()
+                for name in ("i" * 40, "W" * 80, "中文混排i" * 30, "a.M1V"):
+                    canvas.draw(name, 14, 43, 0xFFFFFF, 0x121C24)
+                    self.assertEqual(device.text_calls[-1], name)
+                    self.assertEqual(device.presentation_rectangles[-1], (14, 43, 214, 16))
+                    self.assertEqual(len(device.presentations[-1]), 214 * 16 * 4)
+                # Forty narrow glyphs extend beyond the old 23-character limit.
+                self.assertEqual(struct.unpack_from("<I", device.presentations[0], 100 * 4)[0], 0xFFFFFF)
+                # A short name following a long one leaves clean background.
+                self.assertEqual(struct.unpack_from("<I", device.presentations[-1], 150 * 4)[0], 0x121C24)
+            finally:
+                canvas.close()
+        self.assertEqual(native_runtime.clip_area(device, device.active), original_clip)
+        self.assertEqual(len(device.freed), 2)
+        self.assertEqual(device.closed, 1)
+
+    def test_list_passes_full_filename_and_closes_canvas_on_failure(self):
+        name = "很长的文件名" * 12 + "-iiiiiiiiiiiiiiiiiiiiiiiiiiii.M1V"
+        model = PlayerModel([FileEntry(name, name, ".M1V", 1024)])
+        calls = []
+
+        class Canvas(RecordingTextCanvas):
+            def start(self):
+                calls.append("start")
+
+            def draw(self, value, *args):
+                calls.append(value)
+                raise RuntimeError("draw failed")
+
+            def close(self):
+                calls.append("close")
+
+        screen = runtime.PlayerScreen(text_canvas_factory=Canvas)
+        with self.assertRaisesRegex(RuntimeError, "draw failed"):
+            screen.list(model)
+        self.assertEqual(calls, ["start", name, "close"])
+
+    def make_compositor(self):
+        device = CompositorDevice()
+        screen = (0x3012CCC8, 320, 240, 1280, 0x31E80000, 32)
+        images = native_runtime.OwnedImages(device, 0x3012CBC8, screen)
+        source = images.create(320, 240)
+        clean = struct.pack("<I", 0x123456) * (320 * 240)
+        device.store(source[4], clean)
+        compositor = compositor_runtime.FrameCompositor(images)
+        compositor.start()
+        return device, images, source, clean, compositor
+
+    def test_complete_frame_only_source_preserved_and_grob_restored(self):
+        device, images, source, clean, compositor = self.make_compositor()
+        self.assertEqual(compositor.begin(source[4]), 9)
+        device.fillrect(9, 6, 218, 308, 4, 0x35D0BA, 0x35D0BA)
+        self.assertEqual(device.presentations, [])
+        with self.assertRaisesRegex(native_runtime.Error, "NOT_FINISHED"):
+            compositor.present()
+        compositor.end()
+        compositor.present()
+        self.assertEqual(len(device.presentations), 1)
+        self.assertNotEqual(device.presentations[0], clean)
+        self.assertEqual(device.read(source[4], len(clean)), clean)
+        self.assertEqual(device.read(device.original_grob, 26),
+                         b"original G9 remains intact")
+        compositor.close()
+        self.assertEqual(images.release(), [])
+        self.assertEqual(len(device.freed), 3)
+
+    def test_guard_mismatch_and_firmware_mismatch_are_rejected(self):
+        device, images, source, clean, compositor = self.make_compositor()
+        device.store(compositor.pixels + len(clean), b"bad!")
+        with self.assertRaisesRegex(native_runtime.Error, "GUARD_CHANGED"):
+            compositor.close()
+        device.store(grob_profile.CHECKS[0][0], b"bad!")
+        count = len(images.allocated)
+        with self.assertRaisesRegex(native_runtime.Error, "FIRMWARE_MISMATCH"):
+            compositor_runtime.FrameCompositor(images).start()
+        self.assertEqual(len(images.allocated), count)
+
+    def test_play_pause_seek_modes_and_draw_failure_never_present_bare_ui(self):
+        device, images, source, clean, compositor = self.make_compositor()
+
+        class Session(CompositionSession):
+            def begin_composition(self):
+                return compositor.begin(source[4])
+
+            def end_composition(self):
+                compositor.end()
+
+            def present_composition(self):
+                compositor.present()
+
+            def present_current(self):
+                device.call("put", 0, 0, source[0], 0)
+
+        session = Session()
+        model = PlayerModel([FileEntry("movie.M1V", "movie.M1V", ".M1V", 1024)])
+        model.state = PlayerState.PLAYING
+        screen = runtime.PlayerScreen()
+        with patch.object(runtime, "hpprime", device):
+            for mode in (DebugMode.PROGRESS, DebugMode.FULL):
+                model.debug_mode = mode
+                screen.video_frame_updated()
+                screen.playback(model.files[0], session, model)
+                self.assertNotEqual(device.presentations[-1], clean)
+            count = len(device.presentations)
+            screen.playback(model.files[0], session, model)
+            self.assertEqual(len(device.presentations), count)
+            model.state = PlayerState.PAUSED
+            model.debug_mode = DebugMode.PROGRESS
+            session.position_tenths = 990
+            screen.playback(model.files[0], session, model, True)
+            model.state = PlayerState.SEEKING
+            model.seek_target = 5
+            screen.playback(model.files[0], session, model)
+            model.debug_mode = DebugMode.OFF
+            screen.playback(model.files[0], session, model)
+            self.assertEqual(device.presentations[-1], clean)
+            count = len(device.presentations)
+            model.debug_mode = DebugMode.FULL
+            with patch.object(device, "textout", side_effect=RuntimeError("draw failed")):
+                with self.assertRaisesRegex(RuntimeError, "draw failed"):
+                    screen.playback(model.files[0], session, model)
+            self.assertFalse(compositor.bound)
+            self.assertEqual(screen._target, 0)
+            self.assertEqual(device.presentations[-1], clean)
+            self.assertEqual(len(device.presentations), count)
+            screen.playback(model.files[0], session, model)
+            self.assertEqual(len(device.presentations), count + 1)
+        self.assertEqual(device.read(source[4], len(clean)), clean)
+        compositor.close()
+
+    def test_failed_bind_readback_restores_original_slot(self):
+        device, images, source, clean, compositor = self.make_compositor()
+        original = compositor._slot
+        calls = [0]
+
+        def read_slot():
+            calls[0] += 1
+            if calls[0] == 2:
+                raise RuntimeError("readback failed")
+            return original()
+
+        with patch.object(compositor, "_slot", side_effect=read_slot):
+            with self.assertRaisesRegex(RuntimeError, "readback failed"):
+                compositor.begin(source[4])
+        self.assertFalse(compositor.bound)
+        self.assertEqual(original(), device.original_grob)
+        self.assertEqual(device.presentations, [])
+
+    def test_mpeg_decode_and_seek_do_not_submit_and_pause_renders_skipped_frame(self):
+        entry = FileEntry("movie.M1V", "movie.M1V", ".M1V", 1000)
+        session = sessions.M1VPlaybackSession(None, entry)
+        commands = []
+
+        def command(command, **kwargs):
+            commands.append((command, kwargs))
+            words = [0] * 48
+            words[17], words[19] = 1, 100
+            return sessions.mpeg_profile.FRAME_READY, words
+
+        session._command = command
+        self.assertTrue(session.next_frame(True))
+        self.assertEqual(session.frame_revision, 1)
+        self.assertTrue(session.next_frame(False))
+        self.assertTrue(session.rgb_pending)
+        session.prepare_current()
+        self.assertEqual(commands[-1][0], sessions.mpeg_profile.COMMAND_RENDER)
+        self.assertFalse(session.rgb_pending)
+        self.assertEqual(session.frame_revision, 2)
+        with patch.object(session, "_find_anchor", return_value=0), \
+                patch.object(session, "_restart_at"):
+            self.assertEqual(session.seek_tenths(100), 100)
+        self.assertEqual(commands[-1][0], sessions.mpeg_profile.COMMAND_RENDER)
+        # dbg=None ensures an accidental native presentation would fail here.
+
+    def test_mjpg_decode_and_seek_never_submit_without_composition(self):
+        session = sessions.MjpgPlaybackSession(None,
+            FileEntry("movie.MJPG", "movie.MJPG", ".MJPG", 1024))
+        session.header = types.SimpleNamespace(frame_count=1)
+        session.file = types.SimpleNamespace(
+            position=0, verify_eof=lambda: None,
+            read_small=lambda size: struct.pack("<I", 256),
+            read_exact_to=lambda *args: None,
+            read_owned_bytes=lambda *args: bytes(256),
+            seek_absolute=lambda offset: None)
+        decoded = []
+        session.decoder = types.SimpleNamespace(input_address=0x31100000,
+            decode_loaded_to_buffer=lambda size: decoded.append(size))
+        with patch.object(sessions, "validate_baseline_jpeg"):
+            self.assertTrue(session.next_frame(True))
+            self.assertEqual(session.seek_tenths(0), 1000)
+        self.assertEqual(decoded, [256, 256])
+        self.assertEqual(session.frame_revision, 2)
+
+    def test_skipped_playing_frame_has_no_composition_or_submission(self):
+        model = PlayerModel([FileEntry("movie.M1V", "movie.M1V", ".M1V", 1024)])
+        model.state = PlayerState.PLAYING
+        calls = []
+        presents = iter((False, True))
+        clock = types.SimpleNamespace(
+            should_present=lambda timing: next(presents),
+            frame_decoded=lambda p, ms, timing: calls.append(("clock", p)),
+            late_frames=0, presented_frames=1, dropped_frames=1,
+            display_fps_tenths=250)
+        session = CompositionSession()
+        session.entry = model.files[0]
+        session.next_frame = lambda p: calls.append(("decode", p)) or True
+        screen = types.SimpleNamespace(
+            video_frame_updated=lambda: calls.append(("updated",)),
+            playback=lambda *args: calls.append(("compose",)))
+        player = player_runtime.PrimeVideoPlayer(screen=screen,
+            position_store=types.SimpleNamespace(set=lambda *args: None),
+            settings_store=types.SimpleNamespace())
+        player.session, player.clock = session, clock
+        player.screen_awake = types.SimpleNamespace(refresh=lambda: None)
+        with patch.object(player_runtime, "ticks_ms", return_value=0), \
+                patch.object(player_runtime, "key_event", side_effect=(None, "BACK")):
+            self.assertEqual(player._run_current(model), "STOP")
+        self.assertEqual(calls, [("decode", False), ("clock", False),
+            ("decode", True), ("updated",), ("compose",), ("clock", True)])
 
 
 if __name__ == "__main__":

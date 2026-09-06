@@ -6,6 +6,7 @@ import prime_mjpeg_decoder
 import prime_native as native
 import prime_video_profile as app_profile
 import mpeg_stream_profile as mpeg_profile
+from prime_video_compositor import FrameCompositor
 from mjpg_container import (HEADER_BYTES, MAX_FRAME_BYTES, MjpgError,
                             parse_header, validate_baseline_jpeg)
 from prime_video_io import NativeFile
@@ -17,7 +18,27 @@ FULL_CLIP = (0, 0, 319, 239)
 ANCHOR_SCAN_BYTES = 512 * 1024
 
 
-class MjpgPlaybackSession:
+class BufferedPlayback:
+    def begin_composition(self):
+        self.prepare_current()
+        return self.compositor.begin(self.frame_buffer)
+
+    def end_composition(self):
+        self.compositor.end()
+
+    def present_composition(self):
+        self._mark_screen_used()
+        self.compositor.present()
+
+    def _mark_screen_used(self):
+        pass
+
+    def _close_compositor(self):
+        if self.compositor is not None:
+            self.compositor.close()
+
+
+class MjpgPlaybackSession(BufferedPlayback):
     def __init__(self, dbg, entry, emit=None, settings=None):
         self.dbg, self.entry = dbg, entry
         self.emit = emit or (lambda message, visible=True: None)
@@ -33,10 +54,14 @@ class MjpgPlaybackSession:
         self.presented_frames = 0
         self.dropped_frames = 0
         self.display_fps_tenths = 0
+        self.compositor = None
+        self.frame_revision = 0
 
     def start(self):
         self.decoder = prime_mjpeg_decoder.DecoderSession(self.dbg, self.emit)
         self.decoder.start()
+        self.compositor = FrameCompositor(self.decoder.images)
+        self.compositor.start()
         self.file = NativeFile(self.dbg, self.decoder.images,
                                self.decoder.input_address,
                                self.decoder.input_span, self.entry)
@@ -61,13 +86,19 @@ class MjpgPlaybackSession:
         return min(1000, self.frames * 1000 // self.header.frame_count)
 
     def set_video_bottom(self, bottom):
-        if bottom not in (179, 217, 239):
+        if bottom != 239:
             raise Error("DISPLAY_CLIP_INVALID")
-        if bottom != self.video_bottom:
-            self.dbg.raw("clip", 0, 0, 319, bottom)
-            self.video_bottom = bottom
-            if self.current_frame:
-                self.present_current()
+
+    @property
+    def frame_buffer(self):
+        return self.decoder.output
+
+    def prepare_current(self):
+        if not self.current_frame:
+            raise Error("NO_VIDEO_FRAME")
+
+    def _mark_screen_used(self):
+        self.decoder.direct_used = True
 
     def present_current(self):
         if self.current_frame:
@@ -86,8 +117,7 @@ class MjpgPlaybackSession:
         validate_baseline_jpeg(data)
         self.decoder.decode_loaded_to_buffer(size)
         self.current_frame = True
-        if present:
-            self.present_current()
+        self.frame_revision += 1
         padding = (-size) & 3
         if padding:
             self.file.read_exact_to(self.decoder.input_address + size, padding)
@@ -122,6 +152,13 @@ class MjpgPlaybackSession:
 
     def close(self):
         errors = []
+        try:
+            self._close_compositor()
+        except BaseException as exc:
+            if self.compositor.bound:
+                # Never free an object still referenced by the application.
+                raise
+            errors.append(str(exc))
         if self.file is not None:
             try:
                 self.file.close()
@@ -177,7 +214,7 @@ class NativeModule:
             raise Error("MPEG_CODE_GUARD_CHANGED")
 
 
-class M1VPlaybackSession:
+class M1VPlaybackSession(BufferedPlayback):
     def __init__(self, dbg, entry, emit=None, settings=None):
         self.dbg, self.entry = dbg, entry
         self.emit = emit or (lambda message, visible=True: None)
@@ -199,6 +236,9 @@ class M1VPlaybackSession:
         self.presented_frames = 0
         self.dropped_frames = 0
         self.display_fps_tenths = 0
+        self.compositor = None
+        self.frame_revision = 0
+        self.rgb_pending = False
 
     def _guarded(self, size):
         image = self.images.create(256, (size + 95 + 1023) // 1024)
@@ -244,6 +284,8 @@ class M1VPlaybackSession:
             256, (mpeg_stream_payload.MODULE_BYTES + 95 + 1023) // 1024)
         self.code = NativeModule(self.images, code_image, mpeg_stream_payload)
         self.saved = self.images.create(320, 240)
+        self.compositor = FrameCompositor(self.images)
+        self.compositor.start()
 
         self.file = NativeFile(self.dbg, self.images, self.staging,
                                mpeg_profile.STAGING_BYTES, self.entry)
@@ -261,6 +303,7 @@ class M1VPlaybackSession:
             size = min(4096, mpeg_profile.OUTPUT_BYTES - offset)
             self.images.write(self.saved[4] + offset,
                               self.dbg.read(self.screen[4] + offset, size))
+        self.saved_valid = True
         self.dbg.raw("clip", *FULL_CLIP)
         self.code.load()
         words = [0] * mpeg_profile.RESULT_WORDS
@@ -317,7 +360,23 @@ class M1VPlaybackSession:
 
     def present_current(self):
         if self.current_frame:
+            self.prepare_current()
             self.dbg.call("put", 0, 0, self.output_header, 0)
+
+    @property
+    def frame_buffer(self):
+        return self.output
+
+    def prepare_current(self):
+        if not self.current_frame:
+            raise Error("NO_VIDEO_FRAME")
+        if self.rgb_pending:
+            result, words = self._command(mpeg_profile.COMMAND_RENDER)
+            if result != mpeg_profile.FRAME_READY:
+                raise Error("MPEG_RENDER_FAILED code=0x%x detail=%d" %
+                            (result, words[39]))
+            self.rgb_pending = False
+            self.frame_revision += 1
 
     def _context_words(self):
         words = struct.unpack("<%dI" % mpeg_profile.RESULT_WORDS,
@@ -425,8 +484,9 @@ class M1VPlaybackSession:
                 self.frames = words[17]
                 self._update_position(words)
                 self.current_frame = True
+                self.rgb_pending = not present
                 if present:
-                    self.present_current()
+                    self.frame_revision += 1
                 return True
             if result == mpeg_profile.NEED_INPUT:
                 self._feed()
@@ -451,15 +511,17 @@ class M1VPlaybackSession:
             decoded = True
         if not decoded:
             raise Error("MPEG_SEEK_NO_FRAME")
-        result, words = self._command(mpeg_profile.COMMAND_RENDER)
-        if result != mpeg_profile.FRAME_READY:
-            raise Error("MPEG_RENDER_FAILED code=0x%x detail=%d" %
-                        (result, words[39]))
-        self.present_current()
+        self.prepare_current()
         return self.position_tenths
 
     def close(self):
         errors = []
+        try:
+            self._close_compositor()
+        except BaseException as exc:
+            if self.compositor.bound:
+                raise
+            errors.append(str(exc))
         if self.initialized:
             try:
                 result, words = self._command(mpeg_profile.COMMAND_RESET)
@@ -478,7 +540,7 @@ class M1VPlaybackSession:
             try:
                 if self.code is not None:
                     self.code.check_guards()
-                if hasattr(self, "saved"):
+                if getattr(self, "saved_valid", False):
                     self.dbg.raw("clip", *FULL_CLIP)
                     self.dbg.call("put", 0, 0, self.saved[0], 0)
                     native.compare_buffers(self.dbg, self.saved[4],

@@ -1,6 +1,6 @@
-"""PrimeVideoPlayer 1.1.0 fixed G1 firmware profile."""
+"""PrimeVideoPlayer 1.1.1 fixed G1 firmware profile."""
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 TARGET = "HP Prime G1 / firmware 2025-09-15"
 APP_DIR = "C:\\DATA\\PrimeVideoPlayer.hpappdir\\"
 SCAN_PATTERN = APP_DIR + "*.*"
